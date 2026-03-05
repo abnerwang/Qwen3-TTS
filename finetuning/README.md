@@ -119,3 +119,90 @@ python sft_12hz.py \
   --num_epochs ${EPOCHS} \
   --speaker_name ${SPEAKER_NAME}
 ```
+---
+
+## Multi-speaker fine-tuning from `train.tsv`
+
+> The original `sft_12hz.py` is single-speaker. This repo also provides a multi-speaker pipeline for a 3-column TSV:
+>
+> `wav_path<TAB>asr_text<TAB>speaker_name`
+
+### 1) Convert TSV to raw JSONL
+
+```bash
+python prepare_multispeaker_data.py \
+  --input_tsv train.tsv \
+  --output_jsonl train_raw_multispeaker.jsonl
+```
+
+Optional: set speaker-specific reference audios by a JSON file:
+
+```json
+{
+  "speaker_a": "./refs/speaker_a_ref.wav",
+  "speaker_b": "./refs/speaker_b_ref.wav"
+}
+```
+
+Then run:
+
+```bash
+python prepare_multispeaker_data.py \
+  --input_tsv train.tsv \
+  --output_jsonl train_raw_multispeaker.jsonl \
+  --speaker_ref_json speaker_ref.json
+```
+
+If `--speaker_ref_json` is not provided, the first utterance of each speaker in `train.tsv` is used as `ref_audio`.
+
+### 2) Extract `audio_codes`
+
+```bash
+python prepare_data.py \
+  --device cuda:0 \
+  --tokenizer_model_path Qwen/Qwen3-TTS-Tokenizer-12Hz \
+  --input_jsonl train_raw_multispeaker.jsonl \
+  --output_jsonl train_with_codes_multispeaker.jsonl
+```
+
+### 3) Multi-speaker SFT
+
+```bash
+python sft_12hz_multispeaker.py \
+  --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --output_model_path output_multispeaker \
+  --train_jsonl train_with_codes_multispeaker.jsonl \
+  --batch_size 8 \
+  --lr 2e-6 \
+  --num_epochs 10 \
+  --speaker_id_start 3000
+```
+
+The script will:
+- automatically build `speaker_name -> speaker_id` mapping,
+- write mapping into checkpoint `config.json` under `talker_config.spk_id`,
+- initialize each speaker embedding slot with the mean speaker encoder embedding of that speaker.
+
+### 4) Inference
+
+After training, pick one speaker name from your TSV and run:
+
+```python
+import torch
+import soundfile as sf
+from qwen_tts import Qwen3TTSModel
+
+device = "cuda:0"
+tts = Qwen3TTSModel.from_pretrained(
+    "output_multispeaker/checkpoint-epoch-2",
+    device_map=device,
+    dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
+)
+
+wavs, sr = tts.generate_custom_voice(
+    text="你好，这是一个多说话人微调测试。",
+    speaker="speaker_a",
+)
+sf.write("output_multispeaker.wav", wavs[0], sr)
+```
