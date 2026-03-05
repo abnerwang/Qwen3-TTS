@@ -95,21 +95,18 @@ def train():
                 speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
 
                 input_text_ids = input_ids[:, :, 0]
-                input_codec_ids = input_ids[:, :, 1]
+                input_codec_ids = input_ids[:, :, 1].clone()
 
                 input_text_embedding = model.talker.get_text_embeddings()(input_text_ids)
                 if input_text_embedding.shape[-1] != model.talker.config.hidden_size:
                     input_text_embedding = model.talker.text_projection(input_text_embedding)
                 input_text_embedding = input_text_embedding * text_embedding_mask
 
-                input_codec_embedding = model.talker.get_input_embeddings()(input_codec_ids) * codec_embedding_mask
-
                 for idx, spk_name in enumerate(speaker_names):
                     if spk_name is None:
                         raise ValueError("speaker_name should not be None for multi-speaker training")
                     spk_id = speaker2id[spk_name]
                     input_codec_ids[idx, 6] = spk_id
-                    input_codec_embedding[idx, 6, :] = speaker_embedding[idx]
 
                     if spk_name not in speaker_embedding_sum:
                         speaker_embedding_sum[spk_name] = speaker_embedding[idx].to(torch.float32)
@@ -117,6 +114,11 @@ def train():
                     else:
                         speaker_embedding_sum[spk_name] += speaker_embedding[idx].to(torch.float32)
                         speaker_embedding_count[spk_name] += 1
+
+                input_codec_embedding = model.talker.get_input_embeddings()(input_codec_ids) * codec_embedding_mask
+                speaker_slot_embedding = torch.zeros_like(input_codec_embedding)
+                speaker_slot_embedding[:, 6, :] = speaker_embedding
+                input_codec_embedding = input_codec_embedding + speaker_slot_embedding
 
                 input_embeddings = input_text_embedding + input_codec_embedding
 
