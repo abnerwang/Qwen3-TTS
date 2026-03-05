@@ -1,18 +1,7 @@
 # coding=utf-8
 # Copyright 2026 The Alibaba Qwen team.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+
 import argparse
 import json
 import os
@@ -27,10 +16,17 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
 
-target_speaker_embedding = None
-def train():
-    global target_speaker_embedding
 
+def build_speaker_id_map(train_data, speaker_id_start):
+    speaker_names = sorted({line["speaker_name"] for line in train_data})
+    speaker2id = {
+        speaker_name: speaker_id_start + i
+        for i, speaker_name in enumerate(speaker_names)
+    }
+    return speaker2id
+
+
+def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
     parser.add_argument("--output_model_path", type=str, default="output")
@@ -38,50 +34,65 @@ def train():
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--num_epochs", type=int, default=3)
-    parser.add_argument("--speaker_name", type=str, default="speaker_test")
+    parser.add_argument("--speaker_id_start", type=int, default=3000)
     args = parser.parse_args()
 
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
 
-    MODEL_PATH = args.init_model_path
+    model_path = args.init_model_path
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
-        MODEL_PATH,
+        model_path,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     )
-    config = AutoConfig.from_pretrained(MODEL_PATH)
+    config = AutoConfig.from_pretrained(model_path)
 
-    train_data = open(args.train_jsonl).readlines()
+    train_data = open(args.train_jsonl, "r", encoding="utf-8").readlines()
     train_data = [json.loads(line) for line in train_data]
+
+    for i, line in enumerate(train_data):
+        if "speaker_name" not in line:
+            raise ValueError(
+                f"Missing `speaker_name` in sample index {i}. "
+                "Please generate data via prepare_multispeaker_data.py first."
+            )
+
+    speaker2id = build_speaker_id_map(train_data, args.speaker_id_start)
+    max_speaker_id = max(speaker2id.values())
+    speaker_vocab_size = qwen3tts.model.talker.config.vocab_size
+    if max_speaker_id >= speaker_vocab_size:
+        raise ValueError(
+            f"speaker_id ({max_speaker_id}) exceeds talker codec embedding vocab_size ({speaker_vocab_size}). "
+            "Please reduce --speaker_id_start or number of speakers."
+        )
+
     dataset = TTSDataset(train_data, qwen3tts.processor, config)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
     optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
 
-    model, optimizer, train_dataloader = accelerator.prepare(
-        qwen3tts.model, optimizer, train_dataloader
-    )
+    model, optimizer, train_dataloader = accelerator.prepare(qwen3tts.model, optimizer, train_dataloader)
 
-    num_epochs = args.num_epochs
+    speaker_embedding_sum = {}
+    speaker_embedding_count = {}
+
     model.train()
 
-    for epoch in range(num_epochs):
+    for epoch in range(args.num_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
-
-                input_ids = batch['input_ids']
-                codec_ids = batch['codec_ids']
-                ref_mels = batch['ref_mels']
-                text_embedding_mask = batch['text_embedding_mask']
-                codec_embedding_mask = batch['codec_embedding_mask']
-                attention_mask = batch['attention_mask']
-                codec_0_labels = batch['codec_0_labels']
-                codec_mask = batch['codec_mask']
+                input_ids = batch["input_ids"]
+                codec_ids = batch["codec_ids"]
+                ref_mels = batch["ref_mels"]
+                text_embedding_mask = batch["text_embedding_mask"]
+                codec_embedding_mask = batch["codec_embedding_mask"]
+                attention_mask = batch["attention_mask"]
+                codec_0_labels = batch["codec_0_labels"]
+                codec_mask = batch["codec_mask"]
+                speaker_names = batch["speaker_names"]
 
                 speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
-                if target_speaker_embedding is None:
-                    target_speaker_embedding = speaker_embedding
 
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
@@ -92,7 +103,20 @@ def train():
                 input_text_embedding = input_text_embedding * text_embedding_mask
 
                 input_codec_embedding = model.talker.get_input_embeddings()(input_codec_ids) * codec_embedding_mask
-                input_codec_embedding[:, 6, :] = speaker_embedding
+
+                for idx, spk_name in enumerate(speaker_names):
+                    if spk_name is None:
+                        raise ValueError("speaker_name should not be None for multi-speaker training")
+                    spk_id = speaker2id[spk_name]
+                    input_codec_ids[idx, 6] = spk_id
+                    input_codec_embedding[idx, 6, :] = speaker_embedding[idx]
+
+                    if spk_name not in speaker_embedding_sum:
+                        speaker_embedding_sum[spk_name] = speaker_embedding[idx].to(torch.float32)
+                        speaker_embedding_count[spk_name] = 1
+                    else:
+                        speaker_embedding_sum[spk_name] += speaker_embedding[idx].to(torch.float32)
+                        speaker_embedding_count[spk_name] += 1
 
                 input_embeddings = input_text_embedding + input_codec_embedding
 
@@ -105,14 +129,14 @@ def train():
                     inputs_embeds=input_embeddings[:, :-1, :],
                     attention_mask=attention_mask[:, :-1],
                     labels=codec_0_labels[:, 1:],
-                    output_hidden_states=True
+                    output_hidden_states=True,
                 )
 
                 hidden_states = outputs.hidden_states[0][-1]
                 talker_hidden_states = hidden_states[codec_mask[:, 1:]]
                 talker_codec_ids = codec_ids[codec_mask]
 
-                sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+                _, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
 
                 loss = outputs.loss + 0.3 * sub_talker_loss
 
@@ -129,23 +153,25 @@ def train():
 
         if accelerator.is_main_process:
             output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
-            shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
+            shutil.copytree(model_path, output_dir, dirs_exist_ok=True)
 
-            input_config_file = os.path.join(MODEL_PATH, "config.json")
+            input_config_file = os.path.join(model_path, "config.json")
             output_config_file = os.path.join(output_dir, "config.json")
-            with open(input_config_file, 'r', encoding='utf-8') as f:
+            with open(input_config_file, "r", encoding="utf-8") as f:
                 config_dict = json.load(f)
             config_dict["tts_model_type"] = "custom_voice"
             talker_config = config_dict.get("talker_config", {})
             talker_config["spk_id"] = {
-                args.speaker_name: 3000
+                speaker_name: speaker2id[speaker_name]
+                for speaker_name in sorted(speaker2id.keys())
             }
             talker_config["spk_is_dialect"] = {
-                args.speaker_name: False
+                speaker_name: False
+                for speaker_name in sorted(speaker2id.keys())
             }
             config_dict["talker_config"] = talker_config
 
-            with open(output_config_file, 'w', encoding='utf-8') as f:
+            with open(output_config_file, "w", encoding="utf-8") as f:
                 json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
             unwrapped_model = accelerator.unwrap_model(model)
@@ -156,10 +182,16 @@ def train():
             for k in keys_to_drop:
                 del state_dict[k]
 
-            weight = state_dict['talker.model.codec_embedding.weight']
-            state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
+            weight = state_dict["talker.model.codec_embedding.weight"]
+            for speaker_name, speaker_id in speaker2id.items():
+                avg_embedding = speaker_embedding_sum[speaker_name] / speaker_embedding_count[speaker_name]
+                state_dict["talker.model.codec_embedding.weight"][speaker_id] = (
+                    avg_embedding.to(weight.device).to(weight.dtype)
+                )
+
             save_path = os.path.join(output_dir, "model.safetensors")
             save_file(state_dict, save_path)
+
 
 if __name__ == "__main__":
     train()
