@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
 AudioLike = Union[
@@ -205,13 +206,15 @@ class TTSDataset(Dataset):
             codec_mask[i,   8+text_ids_len-1:8+text_ids_len-1+codec_ids_len] = True
             attention_mask[i, :8+text_ids_len+codec_ids_len] = True
         
-        ref_mels = [data['ref_mel'] for data in batch]
-        ref_mels = torch.cat(ref_mels,dim=0)
+        ref_mels = [data['ref_mel'].squeeze(0) for data in batch]
+        ref_mel_lengths = torch.tensor([m.shape[0] for m in ref_mels], dtype=torch.long)
+        ref_mels = pad_sequence(ref_mels, batch_first=True, padding_value=0.0)
         speaker_names = [data.get('speaker_name') for data in batch]
 
         return {
             'input_ids':input_ids,
             'ref_mels':ref_mels,
+            'ref_mel_lengths':ref_mel_lengths,
             'attention_mask':attention_mask,
             'text_embedding_mask':text_embedding_mask.unsqueeze(-1),
             'codec_embedding_mask':codec_embedding_mask.unsqueeze(-1),
