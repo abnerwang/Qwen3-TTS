@@ -59,6 +59,13 @@ def train():
             )
 
     speaker2id = build_speaker_id_map(train_data, args.speaker_id_start)
+    max_speaker_id = max(speaker2id.values())
+    speaker_vocab_size = qwen3tts.model.talker.config.vocab_size
+    if max_speaker_id >= speaker_vocab_size:
+        raise ValueError(
+            f"speaker_id ({max_speaker_id}) exceeds talker codec embedding vocab_size ({speaker_vocab_size}). "
+            "Please reduce --speaker_id_start or number of speakers."
+        )
 
     dataset = TTSDataset(train_data, qwen3tts.processor, config)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
@@ -90,8 +97,12 @@ def train():
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
 
-                input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
-                input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+                input_text_embedding = model.talker.get_text_embeddings()(input_text_ids)
+                if input_text_embedding.shape[-1] != model.talker.config.hidden_size:
+                    input_text_embedding = model.talker.text_projection(input_text_embedding)
+                input_text_embedding = input_text_embedding * text_embedding_mask
+
+                input_codec_embedding = model.talker.get_input_embeddings()(input_codec_ids) * codec_embedding_mask
 
                 for idx, spk_name in enumerate(speaker_names):
                     if spk_name is None:

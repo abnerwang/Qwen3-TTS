@@ -181,7 +181,8 @@ python sft_12hz_multispeaker.py \
 The script will:
 - automatically build `speaker_name -> speaker_id` mapping,
 - write mapping into checkpoint `config.json` under `talker_config.spk_id`,
-- initialize each speaker embedding slot with the mean speaker encoder embedding of that speaker.
+- initialize each speaker embedding slot with the mean speaker encoder embedding of that speaker,
+- support both 1.7B and 0.6B Base models by applying text projection when text embedding size differs from talker hidden size.
 
 ### 4) Inference
 
